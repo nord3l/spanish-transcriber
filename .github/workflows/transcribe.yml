@@ -1,0 +1,379 @@
+name: Transcribe Spanish YouTube Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: "YouTube URL of the Spanish-language video to transcribe"
+        required: true
+        type: string
+      speaker_names:
+        description: "Optional comma-separated host names (e.g. David,Héctor,Ignatius). Maps to detected speakers in order."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      YOUTUBE_URL: ${{ inputs.youtube_url }}
+      SPEAKER_NAMES: ${{ inputs.speaker_names }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp openai-whisper pyannote.audio deepl
+
+      - name: Download audio and capture video title
+        id: download
+        run: |
+          set -euo pipefail
+          # Save the video title for later steps (sanitised for filenames)
+          TITLE=$(yt-dlp --print "%(title)s" "$YOUTUBE_URL")
+          echo "Video title: $TITLE"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+          # Slugify the title for a safe filename
+          SAFE_TITLE=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9]\+/-/g' \
+            | sed 's/^-\+//; s/-\+$//')
+          if [ -z "$SAFE_TITLE" ]; then
+            SAFE_TITLE="transcript"
+          fi
+          echo "safe_title=$SAFE_TITLE" >> "$GITHUB_OUTPUT"
+
+          # Download audio as mp3
+          yt-dlp -x --audio-format mp3 --audio-quality 0 \
+            -o "audio.%(ext)s" "$YOUTUBE_URL"
+
+          ls -la audio.mp3
+
+      - name: Run Whisper (medium model, Spanish)
+        run: |
+          set -euo pipefail
+          whisper audio.mp3 \
+            --model medium \
+            --language Spanish \
+            --task transcribe \
+            --output_format json \
+            --output_dir whisper_out \
+            --verbose False
+          ls -la whisper_out
+
+      - name: Run diarization, translate, and render HTML
+        env:
+          VIDEO_TITLE: ${{ steps.download.outputs.title }}
+          SAFE_TITLE: ${{ steps.download.outputs.safe_title }}
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import html
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          import deepl
+          from pyannote.audio import Pipeline
+
+          # ---------------------------------------------------------------
+          # Config
+          # ---------------------------------------------------------------
+          AUDIO_PATH = "audio.mp3"
+          WHISPER_JSON = "whisper_out/audio.json"
+          OUT_DIR = Path("transcripts")
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          video_title = os.environ["VIDEO_TITLE"]
+          safe_title = os.environ["SAFE_TITLE"]
+          speaker_names_raw = os.environ.get("SPEAKER_NAMES", "").strip()
+          hf_token = os.environ["HF_TOKEN"]
+          deepl_key = os.environ["DEEPL_API_KEY"]
+
+          custom_names = [s.strip() for s in speaker_names_raw.split(",") if s.strip()] if speaker_names_raw else []
+
+          # ---------------------------------------------------------------
+          # Load Whisper segments
+          # ---------------------------------------------------------------
+          with open(WHISPER_JSON, "r", encoding="utf-8") as f:
+              whisper_data = json.load(f)
+          whisper_segments = whisper_data.get("segments", [])
+          print(f"Loaded {len(whisper_segments)} Whisper segments")
+
+          # ---------------------------------------------------------------
+          # Speaker diarization with pyannote.audio
+          # ---------------------------------------------------------------
+          print("Loading pyannote diarization pipeline...")
+          pipeline = Pipeline.from_pretrained(
+              "pyannote/speaker-diarization-3.1",
+              use_auth_token=hf_token,
+          )
+          print("Running diarization...")
+          diarization = pipeline(AUDIO_PATH)
+
+          # Build a list of (start, end, speaker_label) turns
+          turns = []
+          for turn, _, speaker in diarization.itertracks(yield_label=True):
+              turns.append((turn.start, turn.end, speaker))
+          print(f"Diarization produced {len(turns)} turns")
+
+          # Track first-seen order of raw speaker labels so naming is stable
+          first_seen_order = []
+          seen = set()
+          for _, _, spk in turns:
+              if spk not in seen:
+                  seen.add(spk)
+                  first_seen_order.append(spk)
+
+          def map_speaker(raw_label: str) -> str:
+              if raw_label not in first_seen_order:
+                  return raw_label
+              idx = first_seen_order.index(raw_label)
+              if custom_names:
+                  if idx < len(custom_names):
+                      return custom_names[idx]
+                  return f"Speaker {idx + 1}"
+              return f"Host {idx + 1}"
+
+          # ---------------------------------------------------------------
+          # Assign speakers to Whisper segments by max temporal overlap
+          # ---------------------------------------------------------------
+          def speaker_for_segment(seg_start: float, seg_end: float) -> str:
+              best_overlap = 0.0
+              best_speaker = None
+              for t_start, t_end, spk in turns:
+                  overlap = max(0.0, min(seg_end, t_end) - max(seg_start, t_start))
+                  if overlap > best_overlap:
+                      best_overlap = overlap
+                      best_speaker = spk
+              if best_speaker is None:
+                  return "Unknown"
+              return map_speaker(best_speaker)
+
+          enriched = []
+          for seg in whisper_segments:
+              enriched.append({
+                  "start": seg["start"],
+                  "end": seg["end"],
+                  "speaker": speaker_for_segment(seg["start"], seg["end"]),
+                  "es": seg["text"].strip(),
+              })
+
+          # ---------------------------------------------------------------
+          # Group consecutive segments by the same speaker into blocks
+          # ---------------------------------------------------------------
+          blocks = []
+          for seg in enriched:
+              if blocks and blocks[-1]["speaker"] == seg["speaker"]:
+                  blocks[-1]["end"] = seg["end"]
+                  blocks[-1]["es"].append(seg["es"])
+              else:
+                  blocks.append({
+                      "speaker": seg["speaker"],
+                      "start": seg["start"],
+                      "end": seg["end"],
+                      "es": [seg["es"]],
+                  })
+
+          for b in blocks:
+              b["es_text"] = " ".join(b["es"]).strip()
+
+          # ---------------------------------------------------------------
+          # Translate each block to English via DeepL (EN-GB)
+          # ---------------------------------------------------------------
+          print(f"Translating {len(blocks)} blocks via DeepL (EN-GB)...")
+          translator = deepl.Translator(deepl_key)
+          texts = [b["es_text"] for b in blocks]
+          # DeepL accepts a list of strings; chunk to avoid huge payloads
+          CHUNK = 50
+          translated = []
+          for i in range(0, len(texts), CHUNK):
+              part = texts[i:i + CHUNK]
+              result = translator.translate_text(
+                  part,
+                  source_lang="ES",
+                  target_lang="EN-GB",
+              )
+              translated.extend([r.text for r in result])
+          for b, en in zip(blocks, translated):
+              b["en_text"] = en
+
+          # ---------------------------------------------------------------
+          # Build a stable colour palette for speakers
+          # ---------------------------------------------------------------
+          palette = [
+              "#f5f0ff",  # lilac
+              "#eaf5ff",  # pale blue
+              "#fff4e6",  # peach
+              "#e8f7ee",  # mint
+              "#fdeaea",  # blush
+              "#f0f0f0",  # neutral
+          ]
+          ordered_speakers = []
+          for b in blocks:
+              if b["speaker"] not in ordered_speakers:
+                  ordered_speakers.append(b["speaker"])
+          speaker_colour = {
+              spk: palette[i % len(palette)]
+              for i, spk in enumerate(ordered_speakers)
+          }
+
+          # ---------------------------------------------------------------
+          # HTML rendering
+          # ---------------------------------------------------------------
+          def fmt_ts(seconds: float) -> str:
+              seconds = int(seconds)
+              h, rem = divmod(seconds, 3600)
+              m, s = divmod(rem, 60)
+              if h:
+                  return f"{h:d}:{m:02d}:{s:02d}"
+              return f"{m:d}:{s:02d}"
+
+          rows_html = []
+          for b in blocks:
+              bg = speaker_colour.get(b["speaker"], "#ffffff")
+              rows_html.append(f"""
+              <section class="block" style="background:{bg};">
+                <header class="block-header">
+                  <span class="speaker">{html.escape(b['speaker'])}</span>
+                  <span class="timestamp">{fmt_ts(b['start'])} – {fmt_ts(b['end'])}</span>
+                </header>
+                <div class="cols">
+                  <div class="col es">{html.escape(b['es_text'])}</div>
+                  <div class="col en">{html.escape(b['en_text'])}</div>
+                </div>
+              </section>
+              """)
+
+          page = f"""<!DOCTYPE html>
+          <html lang="es">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>{html.escape(video_title)}</title>
+            <style>
+              :root {{
+                --fg: #1a1a1a;
+                --muted: #666;
+                --border: #e2e2e2;
+                --max-width: 1080px;
+              }}
+              * {{ box-sizing: border-box; }}
+              body {{
+                margin: 0;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                             Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+                color: var(--fg);
+                background: #fafafa;
+                line-height: 1.6;
+              }}
+              .container {{
+                max-width: var(--max-width);
+                margin: 0 auto;
+                padding: 2.5rem 1.25rem 4rem;
+              }}
+              h1 {{
+                font-size: 1.75rem;
+                margin: 0 0 0.5rem;
+                line-height: 1.25;
+              }}
+              .source {{
+                color: var(--muted);
+                font-size: 0.9rem;
+                margin-bottom: 2rem;
+                word-break: break-all;
+              }}
+              .source a {{ color: var(--muted); }}
+              .block {{
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                padding: 1rem 1.25rem;
+                margin-bottom: 1rem;
+              }}
+              .block-header {{
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                margin-bottom: 0.75rem;
+                gap: 1rem;
+              }}
+              .speaker {{
+                font-weight: 700;
+                font-size: 1rem;
+              }}
+              .timestamp {{
+                font-size: 0.75rem;
+                color: var(--muted);
+                font-variant-numeric: tabular-nums;
+              }}
+              .cols {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 1.5rem;
+              }}
+              .col {{
+                font-size: 1rem;
+              }}
+              .col.en {{
+                color: #2a2a2a;
+                border-left: 1px solid var(--border);
+                padding-left: 1.5rem;
+              }}
+              @media (max-width: 720px) {{
+                .cols {{ grid-template-columns: 1fr; }}
+                .col.en {{ border-left: none; border-top: 1px solid var(--border);
+                           padding-left: 0; padding-top: 1rem; }}
+              }}
+            </style>
+          </head>
+          <body>
+            <main class="container">
+              <h1>{html.escape(video_title)}</h1>
+              <p class="source">Source: <a href="{html.escape(os.environ.get('YOUTUBE_URL', ''))}">{html.escape(os.environ.get('YOUTUBE_URL', ''))}</a></p>
+              {''.join(rows_html)}
+            </main>
+          </body>
+          </html>
+          """
+
+          out_path = OUT_DIR / f"{safe_title}.html"
+          out_path.write_text(page, encoding="utf-8")
+          print(f"Wrote {out_path}")
+          PY
+
+      - name: Commit and push transcript
+        env:
+          VIDEO_TITLE: ${{ steps.download.outputs.title }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add transcripts/
+          if git diff --staged --quiet; then
+            echo "No transcript changes to commit."
+            exit 0
+          fi
+          git commit -m "transcript: ${VIDEO_TITLE}"
+          git push
