@@ -41,17 +41,48 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
+      - name: Set up Deno (JS runtime for yt-dlp's YouTube extractor)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yt-dlp openai-whisper pyannote.audio deepl
+          # yt-dlp nightly tracks the latest YouTube extractor fixes; the
+          # [default] extra installs the optional networking deps it likes.
+          pip install -U --pre "yt-dlp[default]"
+          pip install openai-whisper pyannote.audio deepl
+
+      - name: Write YouTube cookies (if provided)
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "${YOUTUBE_COOKIES:-}" ]; then
+            printf '%s' "$YOUTUBE_COOKIES" > cookies.txt
+            echo "Cookies file written ($(wc -l < cookies.txt) lines)."
+          else
+            echo "No YOUTUBE_COOKIES secret set; YouTube may block the download from GitHub-hosted runners."
+          fi
 
       - name: Download audio and capture video title
         id: download
         run: |
           set -euo pipefail
-          # Save the video title for later steps (sanitised for filenames)
-          TITLE=$(yt-dlp --print "%(title)s" "$YOUTUBE_URL")
+
+          # Build optional cookies arg
+          COOKIES_ARGS=()
+          if [ -f cookies.txt ]; then
+            COOKIES_ARGS+=(--cookies cookies.txt)
+          fi
+
+          # Player-client fallback chain — these are the clients that have
+          # been most resilient to YouTube's anti-bot checks on cloud IPs.
+          EXTRACTOR_ARGS=(--extractor-args "youtube:player_client=tv_simply,web_safari,mweb,ios")
+
+          # Save the video title for later steps
+          TITLE=$(yt-dlp "${COOKIES_ARGS[@]}" "${EXTRACTOR_ARGS[@]}" \
+            --print "%(title)s" "$YOUTUBE_URL")
           echo "Video title: $TITLE"
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
 
@@ -65,7 +96,8 @@ jobs:
           echo "safe_title=$SAFE_TITLE" >> "$GITHUB_OUTPUT"
 
           # Download audio as mp3
-          yt-dlp -x --audio-format mp3 --audio-quality 0 \
+          yt-dlp "${COOKIES_ARGS[@]}" "${EXTRACTOR_ARGS[@]}" \
+            -x --audio-format mp3 --audio-quality 0 \
             -o "audio.%(ext)s" "$YOUTUBE_URL"
 
           ls -la audio.mp3

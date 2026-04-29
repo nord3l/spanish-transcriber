@@ -39,6 +39,29 @@ Before your first run, add these two secrets in **Settings → Secrets and varia
 
 The commit step uses GitHub's built-in `GITHUB_TOKEN`, so no extra token is needed for pushing the transcript.
 
+### Optional but strongly recommended: `YOUTUBE_COOKIES`
+
+GitHub-hosted runners use IP ranges that YouTube aggressively flags as bot traffic. Without cookies you will frequently see:
+
+```
+ERROR: [youtube] <id>: Sign in to confirm you're not a bot.
+```
+
+The reliable fix is to add a third secret called `YOUTUBE_COOKIES` containing a Netscape-format cookies file exported from a logged-in browser session.
+
+How to export:
+
+1. In a clean browser profile, sign in to YouTube. (Tip: use a private/incognito window so the cookies stay long-lived — closing the window before exporting can shorten their lifetime; just don't sign out.)
+2. Install a "Get cookies.txt" extension (e.g. *Get cookies.txt LOCALLY* for Chrome or *cookies.txt* for Firefox).
+3. Navigate to `https://www.youtube.com` and use the extension to export cookies for that site as a Netscape-format `.txt` file.
+4. Open the file, copy its **entire contents** (including the `# Netscape HTTP Cookie File` header), and paste it as the value of a new repo secret called `YOUTUBE_COOKIES`.
+
+Notes on cookies:
+
+- They are written to a `cookies.txt` file inside the runner only for the duration of the job and never committed.
+- Treat them like a password — anyone with these cookies can access your YouTube account. Use a dedicated/secondary Google account if you're cautious.
+- Cookies expire. If you start seeing the bot-confirmation error again, repeat the export and update the secret.
+
 ## Where the transcripts live
 
 Completed transcripts are written to the [`transcripts/`](./transcripts) folder of this repo. Each file is named after a slugified version of the video title, e.g. `transcripts/episodio-42-la-historia-de-espana.html`. Open the HTML file directly in a browser to read it.
